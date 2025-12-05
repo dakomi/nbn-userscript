@@ -31,7 +31,9 @@ Notes:
   const CACHE_DB = 'nbnRepoCache_v1';
   const CACHE_STORE = 'suburbs';
   const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+  const CACHE_EXPIRY_MS = 4 * 7 * 24 * 60 * 60 * 1000; // 4 weeks
   const MAX_CONCURRENT_FETCHES = 4;
+  const CACHE_MAX_ENTRIES = 100; // Limit the number of cached suburbs
 
   // Legend mapping: connection type token -> { color, label, description }
   // These are modelled after the map legend in the repo README; adjust as needed.
@@ -46,29 +48,11 @@ Notes:
     'Non-NBN': { color: '#6b7280', label: 'Non-NBN/Unknown', desc: 'No NBN service or unknown technology' } // neutral
   };
 
-  // Listing selector heuristics for realestate.com.au (covers typical card structures)
-  const LISTING_SELECTORS = [
-    '[data-testid="result-card"]',
-    '.tier-card',
-    '.residential-card',
-    '.residential-card__content',
-    '.listingCard',
-    '.residential-card__body',
-    '.residentialCard_wrapper'
-  ];
+  // More specific and robust selector for listing cards
+  const LISTING_SELECTORS = ['[data-testid="residential-card-container"]'];
 
-  // Candidate elements within a card that often have suburb/state text
-  const SUBURB_CANDIDATES = [
-    '.listingCardDetails',
-    '.listingCard__details',
-    '.propertyCardDetails',
-    '.residential-card__location',
-    '.property-location',
-    'address',
-    '.property-info',
-    '.property-card__info',
-    '.card__info'
-  ];
+  // More specific selector for the location element within a card
+  const SUBURB_CANDIDATES = ['[data-testid="property-card-location"]'];
 
   // Utility: promisify IDB open/get/put
   function openDb() {
@@ -201,17 +185,23 @@ Notes:
     return enqueue(tryFetch);
   }
 
-  // Heuristic: parse suburb and state from a listing element (search results card) using multiple strategies.
+  // Parse suburb, state and street from a listing element.
   function parseSuburbStateFromListing(cardEl) {
-    // Try candidate nodes first (explicit location elements)
     for (const sel of SUBURB_CANDIDATES) {
       const node = cardEl.querySelector(sel);
       if (node && node.textContent && node.textContent.trim()) {
         const parsed = extractSuburbStateFromText(node.textContent);
-        if (parsed) return parsed;
+        if (parsed) {
+          // Attempt to find a more specific street address element
+          const streetEl = cardEl.querySelector('[data-testid="property-card-street-address"]');
+          if (streetEl) {
+            parsed.street = streetEl.textContent.trim();
+          }
+          return parsed;
+        }
       }
     }
-    // Fallback: search whole card text for patterns like "Chermside QLD 4032" or "Chermside, QLD"
+    // Fallback to searching the whole card
     const text = cardEl.textContent || '';
     return extractSuburbStateFromText(text);
   }
@@ -219,26 +209,74 @@ Notes:
   // Extract suburb/state from arbitrary text using regex patterns
   function extractSuburbStateFromText(text) {
     if (!text) return null;
-    // Normalize whitespace
     const t = text.replace(/\s+/g, ' ').trim();
-    // Pattern: "Suburb, QLD" or "Suburb QLD"
     const stateAbbr = '(NSW|VIC|QLD|SA|WA|TAS|ACT|NT)';
-    const p1 = new RegExp('([A-Za-z\\-\\&\\\'\\.\\s]{2,60})[,\\s]+(' + stateAbbr + ')(?:\\s|$)', 'i');
+    // Pattern 1: "Street, Suburb, STATE"
+    const p1 = new RegExp(`^([^,]+),\\s+([A-Za-z-&'.\\s]{2,60})[,\\s]+(${stateAbbr})(?:\\s|$)`, 'i');
     const m1 = t.match(p1);
     if (m1) {
-      const suburb = m1[1].trim().replace(/[,|.]+$/,'');
-      const state = m1[2].toUpperCase();
-      return { suburb, state };
+      const street = m1[1].trim();
+      const suburb = m1[2].trim().replace(/[,|.]+$/, '');
+      const state = m1[3].toUpperCase();
+      return { suburb, state, street };
     }
-    // Pattern with postcode: "Suburb 4032" (postcode is 4 digits). We'll treat suburb as preceding capitalized token
-    const p2 = /([A-Za-z\-\&\'\s]{2,60})\s+(\d{4})/;
+    // Pattern 2: "Suburb, STATE"
+    const p2 = new RegExp(`([A-Za-z-&'.\\s]{2,60})[,\\s]+(${stateAbbr})(?:\\s|$)`, 'i');
     const m2 = t.match(p2);
     if (m2) {
-      const suburb = m2[1].trim();
-      // For some pages we can derive state from search or leave state as '' to try all states
-      return { suburb, state: '' };
+      const suburb = m2[1].trim().replace(/[,|.]+$/,'');
+      const state = m2[2].toUpperCase();
+      return { suburb, state };
+    }
+    // Pattern 3: "Suburb 4032" (postcode fallback)
+    const p3 = /([A-Za-z-&'\s]{2,60})\s+(\d{4})/;
+    const m3 = t.match(p3);
+    if (m3) {
+      const suburb = m3[1].trim();
+      return { suburb, state: '' }; // State can be inferred later
     }
     return null;
+  }
+
+  // Normalize address string for matching
+  function normalizeAddress(addr) {
+    if (!addr) return '';
+    let a = addr.toLowerCase();
+    // expand abbreviations
+    a = a.replace(/\b(st|str)\b/g, 'street')
+         .replace(/\b(rd)\b/g, 'road')
+         .replace(/\b(ave)\b/g, 'avenue')
+         .replace(/\b(ct)\b/g, 'court')
+         .replace(/\b(pl)\b/g, 'place')
+         .replace(/\b(ln)\b/g, 'lane')
+         .replace(/\b(dr)\b/g, 'drive');
+    // handle unit/flat variations like '1/10' -> 'unit 1 10'
+    a = a.replace(/(\d+)\/(\d+)/g, 'unit $1 $2');
+    // remove punctuation
+    a = a.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, '');
+    // collapse whitespace
+    return a.replace(/\s+/g, ' ').trim();
+  }
+
+  // Create an index of addresses from GeoJSON for quick lookup
+  function indexGeojsonAddresses(geojson) {
+    const index = new Map();
+    if (!geojson || !Array.isArray(geojson.features)) return index;
+    for (const feature of geojson.features) {
+      const props = feature.properties || {};
+      const address = props.full_address || props.address || props.premise_address || props.ADDRESS || props.addr || props.street_address;
+      if (address) {
+        index.set(normalizeAddress(address), feature);
+      }
+    }
+    return index;
+  }
+
+  // Match a listing's address to a feature in the indexed GeoJSON
+  function matchListingAddressToFeature(listingAddress, addressIndex) {
+    if (!listingAddress || !addressIndex) return null;
+    const normalized = normalizeAddress(listingAddress);
+    return addressIndex.get(normalized) || null;
   }
 
   // Summarize geojson features into counts per known type, and derive top types and sample addresses
@@ -303,7 +341,7 @@ Notes:
   }
 
   // UI helpers: style injection
-  GM_addStyle(`
+  const styles = `
     .nbn-badge {
       display:inline-block;
       padding:3px 8px;
@@ -313,6 +351,7 @@ Notes:
       font-size:12px;
       margin-left:6px;
       cursor:pointer;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
     }
     .nbn-popup {
       position: absolute;
@@ -345,7 +384,14 @@ Notes:
     }
     .nbn-legend .legend-row { display:flex; gap:8px; align-items:center; margin:6px 0; }
     .nbn-legend .dot { width:12px; height:12px; border-radius:3px; display:inline-block; }
-  `);
+  `;
+  if (typeof GM_addStyle === 'function') {
+    GM_addStyle(styles);
+  } else {
+    const styleEl = document.createElement('style');
+    styleEl.textContent = styles;
+    document.head.appendChild(styleEl);
+  }
 
   // Create or reuse a small persistent legend in the corner
   function ensureLegend() {
@@ -374,14 +420,21 @@ Notes:
   }
 
   // Create badge DOM element for a listing given summary (counts)
-  function makeBadgeElement(summary, suburb, state, sourceUrl) {
-    const primaryType = selectPrimaryType(summary.counts);
+  function makeBadgeElement(summary, suburb, state, sourceUrl, matchedFeature = null) {
+    let primaryType, labelText;
+    if (matchedFeature) {
+      primaryType = normalizeTypeString(matchedFeature.properties.nbn_technology || matchedFeature.properties.technology);
+      labelText = `${primaryType} (Confirmed)`;
+    } else {
+      primaryType = selectPrimaryType(summary.counts);
+      const total = summary.total || Object.values(summary.counts || {}).reduce((s, v) => s + v, 0);
+      labelText = primaryType + (total ? ` (${total})` : '');
+    }
+
     const legendEntry = LEGEND[primaryType] || { color: '#6b7280', label: primaryType || 'Unknown', desc: '' };
     const badge = document.createElement('span');
     badge.className = 'nbn-badge';
     badge.style.background = legendEntry.color;
-    const total = summary.total || Object.values(summary.counts || {}).reduce((s,v)=>s+v,0);
-    const labelText = legendEntry.label + (total ? ` (${total})` : '');
     badge.textContent = labelText;
     // attach metadata
     badge.dataset.suburb = suburb;
@@ -400,11 +453,22 @@ Notes:
       popup.style.top = `${window.scrollY + rect.bottom + 6}px`;
       popup.style.left = `${Math.min(window.scrollX + rect.left, window.innerWidth - 300)}px`;
 
+      const header = document.createElement('div');
+      header.style.display = 'flex';
+      header.style.justifyContent = 'space-between';
+      header.style.alignItems = 'center';
       const title = document.createElement('div');
       title.style.fontWeight = '700';
-      title.style.marginBottom = '6px';
       title.textContent = `${suburb || 'Unknown'} ${state || ''} — NBN summary`;
-      popup.appendChild(title);
+      const closeBtn = document.createElement('span');
+      closeBtn.textContent = '×';
+      closeBtn.style.cursor = 'pointer';
+      closeBtn.style.fontSize = '20px';
+      closeBtn.style.lineHeight = '1';
+      closeBtn.addEventListener('click', () => popup.remove());
+      header.appendChild(title);
+      header.appendChild(closeBtn);
+      popup.appendChild(header);
 
       if (summary.total === 0) {
         const n = document.createElement('div');
@@ -521,10 +585,16 @@ Notes:
     const suburb = parsed.suburb;
     const state = (parsed.state || '').toUpperCase();
 
-    // attempt to append badge into the typical title/metadata area
-    // choose an insertion target that visually fits: prefer first element with price or header, else card root
+    // Use a more specific insertion point for the badge
     const insertionCandidates = [
-      '.listingCard__price', '.property-price', '.residential-card__header', '.detail-card__head', '.card__header', '.card__info', '.residential-card__content'
+      '[data-testid="property-card-price"]',
+      '.listingCard__price',
+      '.property-price',
+      '.residential-card__header',
+      '.detail-card__head',
+      '.card__header',
+      '.card__info',
+      '.residential-card__content'
     ];
     let insertTarget = null;
     for (const sel of insertionCandidates) {
@@ -537,6 +607,9 @@ Notes:
     try {
       const geojson = await fetchSuburbGeoJSON(suburb, state);
       const summary = summarizeGeoJSON(geojson);
+      const addressIndex = indexGeojsonAddresses(geojson);
+      const matchedFeature = matchListingAddressToFeature(parsed.street, addressIndex);
+
       // attach source url if available from cached object (we stored source when caching)
       const key = `${state}|${toRepoSlug(suburb)}`;
       let sourceUrl = '';
@@ -545,7 +618,7 @@ Notes:
         if (cached && cached.source) sourceUrl = cached.source;
       } catch (e) { /* ignore */ }
 
-      const badge = makeBadgeElement(summary, suburb, state, sourceUrl);
+      const badge = makeBadgeElement(summary, suburb, state, sourceUrl, matchedFeature);
       // avoid multiple badges
       // place before the first link so it doesn't break layout
       insertTarget.appendChild(badge);
@@ -599,8 +672,50 @@ Notes:
   });
   mo.observe(document.body, { childList: true, subtree: true });
 
-  // run initial scan after small delay to allow page scripts to render
-  setTimeout(initialScan, 1200);
+  // Cache cleanup logic
+  function cleanupCache() {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const db = await openDb();
+        const tx = db.transaction(CACHE_STORE, 'readwrite');
+        const store = tx.objectStore(CACHE_STORE);
+        const now = Date.now();
+        const entries = [];
+
+        store.openCursor().onsuccess = (event) => {
+          const cursor = event.target.result;
+          if (cursor) {
+            entries.push({ key: cursor.key, value: cursor.value });
+            cursor.continue();
+          } else {
+            // Sort by last access time (oldest first)
+            entries.sort((a, b) => (a.value.fetchedAt || 0) - (b.value.fetchedAt || 0));
+
+            // Remove expired entries and excess entries
+            const toDelete = entries.filter(e => (now - (e.value.fetchedAt || 0)) > CACHE_EXPIRY_MS);
+            const excessCount = entries.length - toDelete.length - CACHE_MAX_ENTRIES;
+            if (excessCount > 0) {
+              toDelete.push(...entries.slice(toDelete.length, toDelete.length + excessCount));
+            }
+
+            for (const entry of toDelete) {
+              store.delete(entry.key);
+            }
+            resolve();
+          }
+        };
+      } catch (e) {
+        console.warn('NBN cache cleanup error', e);
+        reject(e);
+      }
+    });
+  }
+
+  // run initial scan and cache cleanup after a small delay
+  setTimeout(() => {
+    initialScan();
+    cleanupCache();
+  }, 1200);
 
   // Expose a small debug API on window for manual inspection
   window.__nbn_repo_userscript = {
